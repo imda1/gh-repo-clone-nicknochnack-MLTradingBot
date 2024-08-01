@@ -1,1 +1,207 @@
+# File path: trading_bot.py
 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+import yfinance as yf
+import logging
+import alpaca_trade_api as tradeapi
+import time
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+
+# Logging setup
+logging.basicConfig(filename='trading_bot.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Fetch historical stock data
+def fetch_data(ticker, start_date, end_date):
+    data = yf.download(ticker, start=start_date, end=end_date)
+    data['Return'] = data['Close'].pct_change()
+    data.dropna(inplace=True)
+    return data
+
+# Feature Engineering
+def add_indicators(data):
+    data['SMA'] = data['Close'].rolling(window=20).mean()
+    data['EMA'] = data['Close'].ewm(span=20, adjust=False).mean()
+    data['Momentum'] = data['Close'] - data['Close'].shift(10)
+    data['Volatility'] = data['Close'].rolling(window=20).std()
+    data['RSI'] = compute_rsi(data['Close'])
+    data.dropna(inplace=True)
+    return data
+
+def compute_rsi(series, period=14):
+    delta = series.diff(1)
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# Train Enhanced ML Model
+def train_random_forest_model(data):
+    X = data[['SMA', 'EMA', 'Momentum', 'Volatility', 'RSI']]
+    y = np.where(data['Return'].shift(-1) > 0, 1, 0)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    param_grid = {
+        'n_estimators': [50, 100, 200],
+        'max_depth': [None, 10, 20, 30],
+        'min_samples_split': [2, 5, 10],
+        'min_samples_leaf': [1, 2, 4]
+    }
+    
+    model = GridSearchCV(RandomForestClassifier(random_state=42), param_grid, cv=5, n_jobs=-1)
+    model.fit(X_train, y_train)
+    
+    best_model = model.best_estimator_
+    predictions = best_model.predict(X_test)
+    
+    accuracy = accuracy_score(y_test, predictions)
+    logging.info(f"Random Forest Model Accuracy: {accuracy:.2f}")
+    
+    return best_model
+
+def train_deep_learning_model(data):
+    X = data[['SMA', 'EMA', 'Momentum', 'Volatility', 'RSI']]
+    y = np.where(data['Return'].shift(-1) > 0, 1, 0)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    model = Sequential()
+    model.add(Dense(64, input_dim=X_train.shape[1], activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dropout(0.5))
+    model.add(Dense(1, activation='sigmoid'))
+    
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test))
+    
+    _, accuracy = model.evaluate(X_test, y_test)
+    logging.info(f"Deep Learning Model Accuracy: {accuracy:.2f}")
+    
+    return model
+
+# Trading Strategy with Risk Management
+def generate_signals(data, model, initial_capital=10000, risk_per_trade=0.01):
+    X = data[['SMA', 'EMA', 'Momentum', 'Volatility', 'RSI']]
+    if isinstance(model, Sequential):
+        signals = (model.predict(X) > 0.5).astype(int)
+    else:
+        signals = model.predict(X)
+    data['Signal'] = signals
+    data['Position'] = data['Signal'].diff()
+
+    # Risk management
+    data['Stop_Loss'] = np.where(data['Position'] == 1, data['Close'] * (1 - 0.02), 0)  # 2% stop loss
+    data['Position_Size'] = (initial_capital * risk_per_trade) / (data['Close'] - data['Stop_Loss'])
+    
+    return data
+
+# Backtesting
+def backtest(data, initial_capital=10000):
+    data['Strategy_Return'] = data['Return'] * data['Signal'].shift(1)
+    data['Cumulative_Return'] = (1 + data['Return']).cumprod() * initial_capital
+    data['Cumulative_Strategy_Return'] = (1 + data['Strategy_Return']).cumprod() * initial_capital
+    
+    plt.figure(figsize=(14, 7))
+    plt.plot(data.index, data['Cumulative_Return'], label='Buy and Hold')
+    plt.plot(data.index, data['Cumulative_Strategy_Return'], label='Strategy')
+    plt.legend()
+    plt.show()
+
+    final_value = data['Cumulative_Strategy_Return'].iloc[-1]
+    logging.info(f"Final Portfolio Value: ${final_value:.2f}")
+
+# Automated Trading with Alpaca
+def trade_with_alpaca(data, model, api_key, api_secret, base_url):
+    api = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
+    account = api.get_account()
+    logging.info(f"Account status: {account.status}")
+
+    for index, row in data.iterrows():
+        if row['Signal'] == 1 and row['Position'] == 1:
+            try:
+                order = api.submit_order(
+                    symbol='AAPL',
+                    qty=row['Position_Size'],
+                    side='buy',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                logging.info(f"Bought {row['Position_Size']} shares of AAPL at {row['Close']}")
+            except Exception as e:
+                logging.error(f"Error executing buy order: {e}")
+        
+        if row['Position'] == -1:
+            try:
+                order = api.submit_order(
+                    symbol='AAPL',
+                    qty=row['Position_Size'],
+                    side='sell',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                logging.info(f"Sold {row['Position_Size']} shares of AAPL at {row['Close']}")
+            except Exception as e:
+                logging.error(f"Error executing sell order: {e}")
+        
+        time.sleep(60)  # Avoid hitting API rate limits
+
+# Main Execution
+if __name__ == "__main__":
+    ticker = "AAPL"
+    start_date = "2020-01-01"
+    end_date = "2023-01-01"
+    
+    data = fetch_data(ticker, start_date, end_date)
+    data = add_indicators(data)
+    
+    rf_model = train_random_forest_model(data)
+    dl_model = train_deep_learning_model(data)
+    
+    data_rf = generate_signals(data.copy(), rf_model)
+    data_dl = generate_signals(data.copy(), dl_model)
+    
+    backtest(data_rf)
+    backtest(data_dl)
+
+    # Alpaca API credentials
+    api_key = "YOUR_ALPACA_API_KEY"
+    api_secret = "YOUR_ALPACA_API_SECRET"
+    base_url = "https://paper-api.alpaca.markets"
+
+    trade_with_alpaca(data_rf, rf_model, api_key, api_secret, base_url)
+
+# File path: test_trading_bot.py
+
+import unittest
+from trading_bot import fetch_data, add_indicators, compute_rsi, train_random_forest_model, generate_signals
+
+class TestTradingBot(unittest.TestCase):
+    def setUp(self):
+        self.ticker = "AAPL"
+        self.start_date = "2020-01-01"
+        self.end_date = "2021-01-01"
+        self.data = fetch_data(self.ticker, self.start_date, self.end_date)
+        self.data = add_indicators(self.data)
+
+    def test_fetch_data(self):
+        data = fetch_data(self.ticker, self.start_date, self.end_date)
+        self.assertIsInstance(data, pd.DataFrame)
+        self.assertIn('Close', data.columns)
+
+    def test_add_indicators(self):
+        data = add_indicators(self.data)
+        self.assertIn('SMA', data.columns)
+        self.assertIn('RSI', data.columns)
+
+    def test_compute_rsi(self):
+        rsi = compute_rsi(self.data['Close'])
+        self.assertIsInstance(rsi, pd.Series)
+    
+    def test_train_random_f
